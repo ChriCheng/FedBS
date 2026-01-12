@@ -1,6 +1,7 @@
 import argparse
 import json
 import random
+import copy
 from datetime import datetime
 import time
 import distutils.util
@@ -15,7 +16,6 @@ from matplotlib.ticker import MaxNLocator
 from tqdm import tqdm
 import pandas as pd
 
-from server import *
 from client import *
 from datasets import *
 from utils import *
@@ -65,11 +65,8 @@ def train(
         early=args.early,
     )
 
-    # Server & Client Init
-    trace_func(
-        f"Begin Initing Server {server_subject_id} & Clients {client_subject_id}"
-    )
-    server = Server(args, test_dataset)
+    # Client Init
+    trace_func(f"Begin Initing Clients {client_subject_id}")
     clients = []
     for i in client_subject_id:
         id = []
@@ -102,6 +99,41 @@ def train(
             )
         )
 
+    center_client = random.choice(clients)
+    trace_func(
+        f"Init star topology center client: {center_client.client_id} (not server)"
+    )
+
+    if args.scaffold:
+        c_global = [
+            torch.zeros_like(param).to(center_client.device)
+            for param in center_client.local_model.parameters()
+        ]
+
+    def evaluate_model(model, dataset, device):
+        test_dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+        model.eval()
+        test_acc = 0
+        test_loss = 0
+        criterion = torch.nn.CrossEntropyLoss()
+
+        for batch_idx, (X, y) in enumerate(test_dataloader):
+            X, y = X.to(device), y.to(device)
+
+            with torch.no_grad():
+                y_hat = model(X)
+
+            loss = criterion(y_hat, y)
+            test_loss += loss
+            pred = y_hat.max(-1, keepdim=True)[1]
+            y_true = y.max(-1, keepdim=True)[1]
+            test_acc += pred.eq(y_true).sum().item()
+
+        test_loss = test_loss / len(test_dataloader.dataset)
+        test_acc = test_acc / len(test_dataloader.dataset)
+
+        return test_loss, test_acc
+
     trace_func(f"Begin Training")
     progress = tqdm(
         range(args.global_epochs),
@@ -109,7 +141,12 @@ def train(
         leave=False,
     )
     for epoch in progress:
-        candidates = random.sample(clients, args.sample_num)
+        if args.sample_num >= len(clients):
+            candidates = clients
+        else:
+            non_center_clients = [c for c in clients if c != center_client]
+            sampled_clients = random.sample(non_center_clients, args.sample_num - 1)
+            candidates = [center_client] + sampled_clients
         candidates_id_list = [j.client_id for j in candidates]
         if epoch == 0:
             avg_weight_dict = {}
@@ -131,35 +168,37 @@ def train(
         client_weight_dict = {}
         for j in candidates:
             weight_accumulator = {}
-            for name, params in server.global_model.state_dict().items():
+            for name, params in center_client.local_model.state_dict().items():
                 weight_accumulator[name] = torch.zeros_like(params)
             client_weight_dict[j.client_id] = weight_accumulator
+
+        round_model = copy.deepcopy(center_client.local_model)
 
         for j in candidates:
             if args.scaffold:
                 weight_diff, c_delta = j.local_train(
-                    server.global_model, server.c_global
+                    round_model, c_global
                 )
                 c_delta_list.append(c_delta)
             elif args.fedfa:
                 weight_diff, client_running_mean, client_running_std = j.local_train(
-                    server.global_model
+                    round_model
                 )
                 client_running_mean_list.append(client_running_mean)
                 client_running_std_list.append(client_running_std)
             elif args.GA:
-                weight_diff = j.local_train(server.global_model)
+                weight_diff = j.local_train(round_model)
                 clientloss_before_avg[j.client_id], _ = j.local_eval(j.local_model)
-                clientloss_after_avg[j.client_id], _ = j.local_eval(server.global_model)
+                clientloss_after_avg[j.client_id], _ = j.local_eval(round_model)
             else:
-                weight_diff = j.local_train(server.global_model)
+                weight_diff = j.local_train(round_model)
 
             # evaluation of the last round global model
-            loss, acc = j.local_eval(server.global_model)
+            loss, acc = j.local_eval(round_model)
             eval_loss = eval_loss + loss
             eval_acc = eval_acc + acc
             # weight accumalate
-            for name, params in server.global_model.state_dict().items():
+            for name, params in round_model.state_dict().items():
                 client_weight_dict[j.client_id][name].add_(weight_diff[name])
 
         # average validation metrics of the global model across sampled clients
@@ -170,30 +209,35 @@ def train(
         )
         # early stopping is generally not applied
         early_stopping(
-            eval_loss, server.global_model, eval_acc, epoch, args.global_epochs
+            eval_loss,
+            center_client.local_model,
+            eval_acc,
+            epoch,
+            args.global_epochs,
         )
 
+        for id in candidates_id_list:
+            for name, data in center_client.local_model.state_dict().items():
+                update_per_layer = client_weight_dict[id][name] * avg_weight_dict[id]
+                if data.type() != update_per_layer.type():
+                    data.add_(update_per_layer.to(torch.int64))
+                else:
+                    data.add_(update_per_layer)
+
         if args.scaffold:
-            server.model_aggregate(
-                client_weight_dict,
-                avg_weight_dict=avg_weight_dict,
-                candidates_id_list=candidates_id_list,
-                c_delta_list=c_delta_list,
+            sample_count = len(candidates_id_list)
+            avg_weight = torch.tensor(
+                [1 / sample_count for _ in range(sample_count)],
+                device=center_client.device,
             )
-        elif args.fedfa:
-            server.model_aggregate(
-                client_weight_dict,
-                avg_weight_dict=avg_weight_dict,
-                candidates_id_list=candidates_id_list,
-                client_running_mean_list=client_running_mean_list,
-                client_running_std_list=client_running_std_list,
-            )
-        elif args.GA:
-            server.model_aggregate(
-                client_weight_dict,
-                avg_weight_dict=avg_weight_dict,
-                candidates_id_list=candidates_id_list,
-            )
+            for c_g, c_del in zip(c_global, zip(*c_delta_list)):
+                c_del = torch.sum(avg_weight * torch.stack(c_del, dim=-1), dim=-1)
+                c_g.data += (
+                    sample_count
+                    / (len([int(i) for i in args.sub_id.split(",")]) - 1)
+                ) * c_del
+
+        if args.GA:
             avg_weight_dict = refine_weight_dict_by_GA(
                 avg_weight_dict,
                 candidates_id_list,
@@ -203,12 +247,10 @@ def train(
                 fair_metric="loss",
             )
 
-        else:
-            server.model_aggregate(
-                client_weight_dict,
-                avg_weight_dict=avg_weight_dict,
-                candidates_id_list=candidates_id_list,
-            )
+        for client in clients:
+            for name, param in center_client.local_model.state_dict().items():
+                if "running_mean_bmic" not in name and "running_std_bmic" not in name:
+                    client.local_model.state_dict()[name].copy_(param.clone())
 
         if early_stopping.early_stop:
             trace_func(f"Stopped early, stop epoch:{early_stopping.best_epoch+1}")
@@ -221,8 +263,12 @@ def train(
         trace_func(f"Global Model Val Acc: {100*early_stopping.best_val_acc:.2f}%")
 
     # Test
-    server.global_model.load_state_dict(torch.load(save_path))
-    test_loss, test_acc = server.model_test()
+    center_client.local_model.load_state_dict(
+        torch.load(save_path, map_location=center_client.device)
+    )
+    test_loss, test_acc = evaluate_model(
+        center_client.local_model, test_dataset, center_client.device
+    )
     Server_TestAcc_List.append(round(100 * test_acc, 2))
     trace_func(f"Server Test Acc: {100*test_acc:.2f}%")
 
