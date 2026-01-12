@@ -24,7 +24,7 @@ from otherFedComponents import *
 
 def train(
     args,
-    server_subject_id,
+    test_set_id,
     client_subject_id,
     Server_TestAcc_List,
     trace_func=print,
@@ -40,19 +40,14 @@ def train(
     label_transform = [ArrayToTensor()]
     test_dataset = MIDataset(
         random_state=seed,
-        subject_id=server_subject_id,
+        subject_id=test_set_id,
         root=args.data_path,
         mode="all",
         data_transform=data_transform,
         label_transform=label_transform,
     )
 
-    ## DG-GA
-    if args.GA:
-        clientloss_after_avg = {}
-        clientloss_before_avg = {}
-        step_size = args.step_size
-        step_size_decay = step_size / args.global_epochs
+
 
     early_stopping = EarlyStopping(
         patience=args.patience,
@@ -101,15 +96,10 @@ def train(
 
     center_client = random.choice(clients)
     trace_func(
-        f"Init star topology center client: {center_client.client_id} (not server)"
+        f"Init star topology center client: {center_client.client_id}"
     )
 
-    if args.scaffold:
-        c_global = [
-            torch.zeros_like(param).to(center_client.device)
-            for param in center_client.local_model.parameters()
-        ]
-
+    
     def evaluate_model(model, dataset, device):
         test_dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
         model.eval()
@@ -137,30 +127,18 @@ def train(
     trace_func(f"Begin Training")
     progress = tqdm(
         range(args.global_epochs),
-        desc=f"Subject {server_subject_id} Rounds",
+        desc=f"Subject {test_set_id} Rounds",
         leave=False,
     )
     for epoch in progress:
-        if args.sample_num >= len(clients):
-            candidates = clients
-        else:
-            non_center_clients = [c for c in clients if c != center_client]
-            sampled_clients = random.sample(non_center_clients, args.sample_num - 1)
-            candidates = [center_client] + sampled_clients
+        non_center_clients = [c for c in clients if c != center_client]
+        sampled_clients = random.sample(non_center_clients, args.sample_num - 1)
+        candidates = [center_client] + sampled_clients
         candidates_id_list = [j.client_id for j in candidates]
         if epoch == 0:
             avg_weight_dict = {}
             for id in client_subject_id:
                 avg_weight_dict[id] = 1 / len(candidates_id_list)
-                if args.GA:
-                    clientloss_before_avg[id] = None
-                    clientloss_after_avg[id] = None
-
-        if args.scaffold:
-            c_delta_list = []
-        if args.fedfa:
-            client_running_mean_list = []
-            client_running_std_list = []
 
         eval_loss = 0
         eval_acc = 0
@@ -175,31 +153,15 @@ def train(
         round_model = copy.deepcopy(center_client.local_model)
 
         for j in candidates:
-            if args.scaffold:
-                weight_diff, c_delta = j.local_train(
-                    round_model, c_global
-                )
-                c_delta_list.append(c_delta)
-            elif args.fedfa:
-                weight_diff, client_running_mean, client_running_std = j.local_train(
-                    round_model
-                )
-                client_running_mean_list.append(client_running_mean)
-                client_running_std_list.append(client_running_std)
-            elif args.GA:
-                weight_diff = j.local_train(round_model)
-                clientloss_before_avg[j.client_id], _ = j.local_eval(j.local_model)
-                clientloss_after_avg[j.client_id], _ = j.local_eval(round_model)
-            else:
                 weight_diff = j.local_train(round_model)
 
             # evaluation of the last round global model
-            loss, acc = j.local_eval(round_model)
-            eval_loss = eval_loss + loss
-            eval_acc = eval_acc + acc
+                loss, acc = j.local_eval(round_model)
+                eval_loss = eval_loss + loss
+                eval_acc = eval_acc + acc
             # weight accumalate
-            for name, params in round_model.state_dict().items():
-                client_weight_dict[j.client_id][name].add_(weight_diff[name])
+                for name, params in round_model.state_dict().items():
+                    client_weight_dict[j.client_id][name].add_(weight_diff[name])
 
         # average validation metrics of the global model across sampled clients
         eval_loss /= len(candidates)
@@ -224,28 +186,6 @@ def train(
                 else:
                     data.add_(update_per_layer)
 
-        if args.scaffold:
-            sample_count = len(candidates_id_list)
-            avg_weight = torch.tensor(
-                [1 / sample_count for _ in range(sample_count)],
-                device=center_client.device,
-            )
-            for c_g, c_del in zip(c_global, zip(*c_delta_list)):
-                c_del = torch.sum(avg_weight * torch.stack(c_del, dim=-1), dim=-1)
-                c_g.data += (
-                    sample_count
-                    / (len([int(i) for i in args.sub_id.split(",")]) - 1)
-                ) * c_del
-
-        if args.GA:
-            avg_weight_dict = refine_weight_dict_by_GA(
-                avg_weight_dict,
-                candidates_id_list,
-                clientloss_before_avg,
-                clientloss_after_avg,
-                step_size=step_size - epoch * step_size_decay,
-                fair_metric="loss",
-            )
 
         for client in clients:
             for name, param in center_client.local_model.state_dict().items():
@@ -339,12 +279,7 @@ if __name__ == "__main__":
         default=200,
         help="the number of global communication rounds",
     )
-    parser.add_argument(
-        "--sample_num",
-        type=int,
-        default=4,
-        help="the number of clients sampled per round of federal communications",
-    )
+
     parser.add_argument(
         "--local_epochs",
         type=int,
@@ -438,28 +373,27 @@ if __name__ == "__main__":
     subject_id = [int(i) for i in args.sub_id.split(",")]
 
     for id in subject_id:
-        server_subject_id = []
-        server_subject_id.append(id)
+        test_set_id = []
+        test_set_id.append(id)
         tmp = subject_id.copy()
         tmp.remove(id)
         client_subject_id = tmp
 
         print("----------------------------------------------------------------")
-        print(f"Server Subject {server_subject_id} Begin")
         t_start = time.time() 
-        print("Server subject ID: ", server_subject_id)
+        print("Test subject ID: ", test_set_id)
         print("Client subject ID: ", client_subject_id)
         train(
             args,
-            server_subject_id,
+            test_set_id,
             client_subject_id,
             Server_TestAcc_List,
             trace_func=tqdm.write,
             save_path="%s/Model_ServerSub%s.pth" % (save_path, str(id)),
         )
         t_end = time.time()
-        print(f"Server Subject {server_subject_id} Time Cost: {(t_end - t_start)/60:.2f} min")
-        print(f"Server Subject {server_subject_id} Complete")
+        print(f"Test set id {test_set_id} Time Cost: {(t_end - t_start)/60:.2f} min")
+        print(f"Test set id {test_set_id} Complete")
         print("----------------------------------------------------------------")
 
     mean = round(sum(Server_TestAcc_List) / len(Server_TestAcc_List), 2)

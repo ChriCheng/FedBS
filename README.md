@@ -44,4 +44,6 @@ bash MI1_deepconvnet_fedbs.sh > MI1_deepconvnet_fedbs.log
 bash MI1_shallowconvnet_fedbs.sh > MI1_shallowconvnet_fedbs.log
 bash MI2_eegnet_fedbs.sh > MI2_eegnet_fedbs.log
 bash MI3_eegnet_fedbs.sh > MI3_eegnet_fedbs.log
+## DSGD
+bash MI1_eegnet_DSGD.sh > MI1_eegnet_DSGD.log
 ```
