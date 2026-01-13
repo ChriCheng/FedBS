@@ -278,12 +278,6 @@ if __name__ == "__main__":
         "--samples", type=int, default=1001, help="the sampling points in each trial"
     )
     parser.add_argument(
-        "--TemporalKernel_Times",
-        type=int,
-        default=1,
-        help="the times of temporal convolution kernel",
-    )
-    parser.add_argument(
         "--dropout", type=float, default=0.5, help="the dropout rate of Dropout layer"
     )
 
@@ -339,60 +333,10 @@ if __name__ == "__main__":
         default=False,
         help="if true, early stopping",
     )
-    parser.add_argument(
-        "--patience",
-        type=int,
-        default=50,
-        help="the number of communication rounds patience",
-    )
+    
 
     # About setup and hyperparameters for federated approaches
-    parser.add_argument(
-        "--fedprox",
-        type=lambda x: bool(distutils.util.strtobool(x)),
-        default=False,
-        help="if true, perform fedprox",
-    )
-    parser.add_argument("--mu", type=float, default=1.0, help="mu for fedprox")
-    parser.add_argument(
-        "--scaffold",
-        type=lambda x: bool(distutils.util.strtobool(x)),
-        default=False,
-        help="if true, perform scaffold",
-    )
-    parser.add_argument(
-        "--moon",
-        type=lambda x: bool(distutils.util.strtobool(x)),
-        default=False,
-        help="if true, perform moon",
-    )
-    parser.add_argument(
-        "--temperature", type=float, default=0.5, help="the temperature for moon"
-    )
-    parser.add_argument("--mu_moon", type=float, default=1.0, help="mu for moon")
-    parser.add_argument(
-        "--fedfa",
-        type=lambda x: bool(distutils.util.strtobool(x)),
-        default=False,
-        help="if true, perform fedfa",
-    )
-    parser.add_argument("--prob", type=float, default=0.5, help="probability for fedfa")
-    parser.add_argument(
-        "--GA",
-        type=lambda x: bool(distutils.util.strtobool(x)),
-        default=False,
-        help="if true, perform GA",
-    )
-    parser.add_argument(
-        "--step_size", type=float, default=0.05, help="the step size of GA"
-    )
-    parser.add_argument(
-        "--fedbs",
-        type=lambda x: bool(distutils.util.strtobool(x)),
-        default=False,
-        help="if true, perform fedbs",
-    )
-    parser.add_argument("--rho", type=float, default=0.1, help="rho for fedbs")
+    
 
     args = parser.parse_args()
     print(args)
