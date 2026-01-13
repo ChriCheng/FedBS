@@ -47,6 +47,39 @@ class Client(object):
         
         if self.args.moon:
             self.previous_model = copy.deepcopy(self.local_model).to(self.device)
+    def local_fullbatch_grad(self, model, criterion):
+
+        model.load_state_dict(self.local_model.state_dict())
+        model.zero_grad(set_to_none=True)
+
+        total_loss_sum = 0.0
+        total_samples = 0
+
+        for X, y in self.train_dataloader:
+            X, y = X.to(self.device), y.to(self.device)
+            bs = X.size(0)
+
+            # default reduction="mean"
+            loss = criterion(model(X), y)
+            (loss * bs).backward()
+
+            total_loss_sum += loss.item() * bs
+            total_samples += bs
+
+        # 归一化成 full-batch mean gradient
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.div_(total_samples)
+
+        grad_dict = {
+            name: p.grad.detach().clone()
+            for name, p in model.named_parameters()
+            if p.grad is not None
+        }
+
+        full_batch_loss = total_loss_sum / total_samples
+        return grad_dict, full_batch_loss
+
 
     def local_train(self, model,c_global=None):
 
