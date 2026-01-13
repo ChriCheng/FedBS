@@ -13,7 +13,6 @@ python3 -u ../src/trainDSGD.py \
   --output_path '../output' \
   --ea True \
   --global_epochs 200 \
-  --sample_num 4 \
   --local_epochs 2 \
   --batch_size 32 \
   --lr 0.005 \

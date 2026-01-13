@@ -26,18 +26,23 @@ def train(
     args,
     test_set_id,
     client_subject_id,
-    Server_TestAcc_List,
+    TestAcc_List,
     trace_func=print,
     save_path="./checkpoint.pth",
 ):
-    # Data
+    import copy
+    import random
+    import torch
+    from torch.utils.data import DataLoader
+    from tqdm import tqdm
+
+
     seed = random.randint(1, 100)
     data_transform = [
-        EA() if args.ea else None,
-        # ZScoreNorm(),
         ArrayToTensor(),
     ]
     label_transform = [ArrayToTensor()]
+
     test_dataset = MIDataset(
         random_state=seed,
         subject_id=test_set_id,
@@ -46,8 +51,6 @@ def train(
         data_transform=data_transform,
         label_transform=label_transform,
     )
-
-
 
     early_stopping = EarlyStopping(
         patience=args.patience,
@@ -60,157 +63,192 @@ def train(
         early=args.early,
     )
 
-    # Client Init
     trace_func(f"Begin Initing Clients {client_subject_id}")
     clients = []
-    for i in client_subject_id:
-        id = []
-        id.append(i)  # list
-        # Training set for each client comprises all local data for local training.
-        # While the validation set for each client also comprises of all local data for validate the aggregated global model.
-        # Note that the training and validation datasets are consistent , but the models are not.
-        # Consistent with the paper, we did not employ global model validation for early stopping.
-        # Instead, we trained for a fixed number of epochs, with validation metrics used solely for monitoring.
+    for sid in client_subject_id:
+        sid_list = [sid]
         clients.append(
             Client(
                 args,
                 MIDataset(
                     random_state=seed,
-                    subject_id=id,
+                    subject_id=sid_list,
                     root=args.data_path,
                     mode="all",
                     data_transform=data_transform,
                     label_transform=label_transform,
                 ),
-                MIDataset(
-                    random_state=seed,
-                    subject_id=id,
-                    root=args.data_path,
-                    mode="all",
-                    data_transform=data_transform,
-                    label_transform=label_transform,
-                ),
-                id=i,
+                test_dataset, 
+                id=sid,
             )
         )
 
-    center_client = random.choice(clients)
-    trace_func(
-        f"Init star topology center client: {center_client.client_id}"
-    )
+    client_ids = [c.client_id for c in clients]
 
-    
+    # Star topology 
+    def build_star_in_neighbors(ids, center_id):
+        in_map = {}
+        for cid in ids:
+            if cid == center_id:
+                in_map[cid] = [j for j in ids if j != center_id]  # all leaves
+            else:
+                in_map[cid] = [center_id]  # the hub
+        return in_map
+
+    trace_func("Init decentralized STAR topology with random center per round")
+
+    # Test evaluator (held-out subject)
     def evaluate_model(model, dataset, device):
-        test_dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+        test_loader = DataLoader(dataset, batch_size=8, shuffle=False)
         model.eval()
-        test_acc = 0
-        test_loss = 0
-        criterion = torch.nn.CrossEntropyLoss()
+        test_acc = 0.0
+        test_loss = 0.0
+        crit_sum = torch.nn.CrossEntropyLoss(reduction="sum")
 
-        for batch_idx, (X, y) in enumerate(test_dataloader):
+        for X, y in test_loader:
             X, y = X.to(device), y.to(device)
-
             with torch.no_grad():
                 y_hat = model(X)
-
-            loss = criterion(y_hat, y)
-            test_loss += loss
+            loss_sum = crit_sum(y_hat, y)
+            test_loss += loss_sum.item()
             pred = y_hat.max(-1, keepdim=True)[1]
             y_true = y.max(-1, keepdim=True)[1]
             test_acc += pred.eq(y_true).sum().item()
 
-        test_loss = test_loss / len(test_dataloader.dataset)
-        test_acc = test_acc / len(test_dataloader.dataset)
-
+        test_loss /= len(test_loader.dataset)
+        test_acc /= len(test_loader.dataset)
         return test_loss, test_acc
 
-    trace_func(f"Begin Training")
+    criterion = torch.nn.CrossEntropyLoss()  
+    lambda0 = float(getattr(args, "lr", 0.005))
+    gamma0 = float(getattr(args, "gamma", 1.0))
+
+    # DSGD training loop 
+    trace_func("Begin Training (DSGD, full-batch grad via Client.local_fullbatch_grad)")
     progress = tqdm(
         range(args.global_epochs),
         desc=f"Subject {test_set_id} Rounds",
         leave=False,
     )
-    for epoch in progress:
-        non_center_clients = [c for c in clients if c != center_client]
-        sampled_clients = random.sample(non_center_clients, args.sample_num - 1)
-        candidates = [center_client] + sampled_clients
-        candidates_id_list = [j.client_id for j in candidates]
-        if epoch == 0:
-            avg_weight_dict = {}
-            for id in client_subject_id:
-                avg_weight_dict[id] = 1 / len(candidates_id_list)
+    # ---- choose star center randomly each round ----
+    center_id = random.choice(client_ids)
+    in_neighbor_map = build_star_in_neighbors(client_ids, center_id)
+    for epoch in progress:        
+        # ---- snapshot x^k for all clients ----
+        snapshot_states = {
+            c.client_id: copy.deepcopy(c.local_model.state_dict())
+            for c in clients
+        }
 
-        eval_loss = 0
-        eval_acc = 0
+        # ---- compute full-batch gradients ∇f_i(x_i^k) via client wrapper ----
+        grad_map = {c.client_id: {} for c in clients}
 
-        client_weight_dict = {}
-        for j in candidates:
-            weight_accumulator = {}
-            for name, params in center_client.local_model.state_dict().items():
-                weight_accumulator[name] = torch.zeros_like(params)
-            client_weight_dict[j.client_id] = weight_accumulator
+        mean_loss = 0.0
+        mean_acc = 0.0
 
-        round_model = copy.deepcopy(center_client.local_model)
+        for c in clients:
+            # Ensure grads are computed at x_i^k
+            c.local_model.load_state_dict(snapshot_states[c.client_id])
 
-        for j in candidates:
-                weight_diff = j.local_train(round_model)
+            # Get grad
+            grad_dict, full_batch_loss = c.local_fullbatch_grad(c.local_model, criterion)
 
-            # evaluation of the last round global model
-                loss, acc = j.local_eval(round_model)
-                eval_loss = eval_loss + loss
-                eval_acc = eval_acc + acc
-            # weight accumalate
-                for name, params in round_model.state_dict().items():
-                    client_weight_dict[j.client_id][name].add_(weight_diff[name])
+            # Fill grad_map (we will later index by state_dict keys)
+            for name, g in grad_dict.items():
+                grad_map[c.client_id][name] = g.detach().clone()
 
-        # average validation metrics of the global model across sampled clients
-        eval_loss /= len(candidates)
-        eval_acc /= len(candidates)
+            mean_loss += float(full_batch_loss)
+
+            # Optional monitor acc (keeps your current behavior)
+            _, a = c.local_eval(c.local_model)
+            mean_acc += float(a)
+
+        mean_loss /= len(clients)
+        mean_acc /= len(clients)
+
         progress.set_postfix(
-            {"loss": f"{eval_loss:.4f}", "acc": f"{100*eval_acc:.2f}%"}
-        )
-        # early stopping is generally not applied
-        early_stopping(
-            eval_loss,
-            center_client.local_model,
-            eval_acc,
-            epoch,
-            args.global_epochs,
+            {
+                "loss": f"{mean_loss:.4f}",
+                "acc": f"{100*mean_acc:.2f}%",
+                "center": str(center_id),
+            }
         )
 
-        for id in candidates_id_list:
-            for name, data in center_client.local_model.state_dict().items():
-                update_per_layer = client_weight_dict[id][name] * avg_weight_dict[id]
-                if data.type() != update_per_layer.type():
-                    data.add_(update_per_layer.to(torch.int64))
+        # ---- apply DSGD update exactly like the original form (no simplification) ----
+        gamma_k = gamma0
+        lambda_k = lambda0
+
+        for c in clients:
+            cid = c.client_id
+            x_i = snapshot_states[cid]  # x_i^k
+            N_in = in_neighbor_map[cid]
+
+            # uniform weights w_ij
+            w = 1.0 / len(N_in) if len(N_in) > 0 else 0.0
+
+            new_state = copy.deepcopy(x_i)
+
+            for name, x_i_name in x_i.items():
+                # keep your "bmic running stats" local (no mixing)
+                if "running_mean_bmic" in name or "running_std_bmic" in name:
+                    continue
+
+                # only update floating tensors; keep integer buffers as-is
+                if not torch.is_floating_point(x_i_name):
+                    continue
+
+                # consensus term: sum gamma*w_ij*(x_j^k - x_i^k)
+                consensus = torch.zeros_like(x_i_name)
+                for nj in N_in:
+                    consensus.add_(gamma_k * w * (snapshot_states[nj][name] - x_i_name))
+
+                # gradient term: lambda * grad
+                g = grad_map[cid].get(name, None)
+                if g is None:
+                    grad_term = torch.zeros_like(x_i_name)
                 else:
-                    data.add_(update_per_layer)
+                    # match dtype/device if needed
+                    if g.device != x_i_name.device:
+                        g = g.to(x_i_name.device)
+                    if g.dtype != x_i_name.dtype:
+                        g = g.to(x_i_name.dtype)
+                    grad_term = lambda_k * g
 
+                new_state[name] = x_i_name + consensus - grad_term
 
-        for client in clients:
-            for name, param in center_client.local_model.state_dict().items():
-                if "running_mean_bmic" not in name and "running_std_bmic" not in name:
-                    client.local_model.state_dict()[name].copy_(param.clone())
+            # write back x_i^{k+1}
+            c.local_model.load_state_dict(new_state)
 
+        # ---- build proxy model (global mean) for early stopping / checkpoint ----
+        
         if early_stopping.early_stop:
             trace_func(f"Stopped early, stop epoch:{early_stopping.best_epoch+1}")
             trace_func(f"Global Model Val Acc: {100*early_stopping.best_val_acc:.2f}%")
             break
+
     progress.close()
 
     if not early_stopping.early_stop:
         trace_func(f"Not stopped early, stop epoch:{early_stopping.best_epoch+1}")
         trace_func(f"Global Model Val Acc: {100*early_stopping.best_val_acc:.2f}%")
 
-    # Test
-    center_client.local_model.load_state_dict(
-        torch.load(save_path, map_location=center_client.device)
-    )
-    test_loss, test_acc = evaluate_model(
-        center_client.local_model, test_dataset, center_client.device
-    )
-    Server_TestAcc_List.append(round(100 * test_acc, 2))
-    trace_func(f"Server Test Acc: {100*test_acc:.2f}%")
+    # -------------------------
+    # Per-node test on held-out subject
+    # Store this train() call's per-node acc into TestAcc_List
+    # -------------------------
+    Node_TestAcc_List = {}
+    trace_func("Per-node test accuracy (held-out subject):")
+
+    for c in clients:
+        node_model = copy.deepcopy(c.local_model)
+        node_model.eval()
+
+        test_loss, test_acc = evaluate_model(node_model, test_dataset, c.device)
+        Node_TestAcc_List[c.client_id] = round(100 * test_acc, 2)
+
+        trace_func(f"  Client {c.client_id}: {100*test_acc:.2f}% (loss {test_loss:.4f})")
+
+    TestAcc_List.append(Node_TestAcc_List)
 
 
 if __name__ == "__main__":
@@ -369,7 +407,7 @@ if __name__ == "__main__":
         "============================================================================================="
     )
 
-    Server_TestAcc_List = []
+    TestAcc_List = []
     subject_id = [int(i) for i in args.sub_id.split(",")]
 
     for id in subject_id:
@@ -387,7 +425,7 @@ if __name__ == "__main__":
             args,
             test_set_id,
             client_subject_id,
-            Server_TestAcc_List,
+            TestAcc_List,
             trace_func=tqdm.write,
             save_path="%s/Model_ServerSub%s.pth" % (save_path, str(id)),
         )
@@ -396,14 +434,30 @@ if __name__ == "__main__":
         print(f"Test set id {test_set_id} Complete")
         print("----------------------------------------------------------------")
 
-    mean = round(sum(Server_TestAcc_List) / len(Server_TestAcc_List), 2)
-    Server_TestAcc_List.append(mean)
+    mean = round(sum(TestAcc_List) / len(TestAcc_List), 2)
+    TestAcc_List.append(mean)
 
     print("==============================================================\n")
 
-    columns = [int(i) for i in args.sub_id.split(",")]
-    columns.append("Avg")
-    index = ["Test Acc"]
-    df = pd.DataFrame([Server_TestAcc_List], columns=columns, index=index)
-    print("Test Result: ")
-    print(df)
+    for r, round_dict in enumerate(TestAcc_List, start=1):
+        client_ids = sorted(round_dict.keys())
+
+        accs = [round_dict[cid]["acc"] for cid in client_ids]
+        losses = [round_dict[cid]["loss"] for cid in client_ids]
+
+        avg_acc = sum(accs) / len(accs)
+        avg_loss = sum(losses) / len(losses)
+
+        print(f"round {r}:")
+        print("client :", " ".join(f"{cid:>4}" for cid in client_ids), " avg")
+        print(
+            "acc    :",
+            " ".join(f"{acc:>4.2f}" for acc in accs),
+            f"{avg_acc:>4.2f}",
+        )
+        print(
+            "loss   :",
+            " ".join(f"{loss:>4.4f}" for loss in losses),
+            f"{avg_loss:>4.4f}",
+        )
+        print("-" * 60)
