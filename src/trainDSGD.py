@@ -1,20 +1,10 @@
 import argparse
-import json
-import random
-import copy
 from datetime import datetime
 import time
 import distutils.util
 
 import os
-import sys
-import torch
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.tensorboard import SummaryWriter
-import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
 from tqdm import tqdm
-import pandas as pd
 
 from client import *
 from datasets import *
@@ -52,17 +42,6 @@ def train(
         label_transform=label_transform,
     )
 
-    early_stopping = EarlyStopping(
-        patience=args.patience,
-        verbose=False,
-        delta=0,
-        path=save_path,
-        trace_func=trace_func,
-        counter_info=False,
-        is_save=True,
-        early=args.early,
-    )
-
     trace_func(f"Begin Initing Clients {client_subject_id}")
     clients = []
     for sid in client_subject_id:
@@ -95,161 +74,118 @@ def train(
                 in_map[cid] = [center_id]  # the hub
         return in_map
 
-    trace_func("Init decentralized STAR topology with random center per round")
-
-    # Test evaluator (held-out subject)
-    def evaluate_model(model, dataset, device):
-        test_loader = DataLoader(dataset, batch_size=8, shuffle=False)
-        model.eval()
-        test_acc = 0.0
-        test_loss = 0.0
-        crit_sum = torch.nn.CrossEntropyLoss(reduction="sum")
-
-        for X, y in test_loader:
-            X, y = X.to(device), y.to(device)
-            with torch.no_grad():
-                y_hat = model(X)
-            loss_sum = crit_sum(y_hat, y)
-            test_loss += loss_sum.item()
-            pred = y_hat.max(-1, keepdim=True)[1]
-            y_true = y.max(-1, keepdim=True)[1]
-            test_acc += pred.eq(y_true).sum().item()
-
-        test_loss /= len(test_loader.dataset)
-        test_acc /= len(test_loader.dataset)
-        return test_loss, test_acc
-
-    criterion = torch.nn.CrossEntropyLoss()  
-    lambda0 = float(getattr(args, "lr", 0.005))
-    gamma0 = float(getattr(args, "gamma", 1.0))
 
     # DSGD training loop 
-    trace_func("Begin Training (DSGD, full-batch grad via Client.local_fullbatch_grad)")
+    trace_func("Begin Training (DSGD)")
     progress = tqdm(
         range(args.global_epochs),
         desc=f"Subject {test_set_id} Rounds",
         leave=False,
     )
-    # ---- choose star center randomly each round ----
+    #  choose star center 
     center_id = random.choice(client_ids)
     in_neighbor_map = build_star_in_neighbors(client_ids, center_id)
-    for epoch in progress:        
-        # ---- snapshot x^k for all clients ----
+    criterion = nn.CrossEntropyLoss()
+    trace_func(f"center id is : {center_id}")
+
+    Round_TestAcc_List = []   
+    for epoch in progress:
+        # local multi-step SGD 
+        for c in clients:
+            c.local_model.train()
+
+            optimizer = torch.optim.SGD(
+                c.local_model.parameters(),
+                lr=args.lr,
+                weight_decay=1e-4,
+                momentum=0.9,
+            )
+
+            # mimic FedAvg: local_epochs over local dataloader
+            for _ in range(args.local_epochs):
+                for X, y in c.train_dataloader:
+                    X, y = X.to(c.device), y.to(c.device)
+
+                    y_hat = c.local_model(X)
+                    loss = criterion(y_hat, y)
+
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    optimizer.step()
+
+        # snapshot AFTER local SGD for synchronous gossip 
         snapshot_states = {
             c.client_id: copy.deepcopy(c.local_model.state_dict())
             for c in clients
         }
 
-        # ---- compute full-batch gradients ∇f_i(x_i^k) via client wrapper ----
-        grad_map = {c.client_id: {} for c in clients}
-
-        mean_loss = 0.0
-        mean_acc = 0.0
-
-        for c in clients:
-            # Ensure grads are computed at x_i^k
-            c.local_model.load_state_dict(snapshot_states[c.client_id])
-
-            # Get grad
-            grad_dict, full_batch_loss = c.local_fullbatch_grad(c.local_model, criterion)
-
-            # Fill grad_map (we will later index by state_dict keys)
-            for name, g in grad_dict.items():
-                grad_map[c.client_id][name] = g.detach().clone()
-
-            mean_loss += float(full_batch_loss)
-
-            # Optional monitor acc (keeps your current behavior)
-            _, a = c.local_eval(c.local_model)
-            mean_acc += float(a)
-
-        mean_loss /= len(clients)
-        mean_acc /= len(clients)
-
-        progress.set_postfix(
-            {
-                "loss": f"{mean_loss:.4f}",
-                "acc": f"{100*mean_acc:.2f}%",
-                "center": str(center_id),
-            }
-        )
-
-        # ---- apply DSGD update exactly like the original form (no simplification) ----
-        gamma_k = gamma0
-        lambda_k = lambda0
+        # gossip / consensus step (star topology) 
+        gamma_k = float(getattr(args, "gamma", 1))  
 
         for c in clients:
             cid = c.client_id
-            x_i = snapshot_states[cid]  # x_i^k
+            x_i = snapshot_states[cid]
             N_in = in_neighbor_map[cid]
-
-            # uniform weights w_ij
             w = 1.0 / len(N_in) if len(N_in) > 0 else 0.0
 
             new_state = copy.deepcopy(x_i)
 
             for name, x_i_name in x_i.items():
-                # keep your "bmic running stats" local (no mixing)
                 if "running_mean_bmic" in name or "running_std_bmic" in name:
                     continue
-
-                # only update floating tensors; keep integer buffers as-is
                 if not torch.is_floating_point(x_i_name):
                     continue
 
-                # consensus term: sum gamma*w_ij*(x_j^k - x_i^k)
                 consensus = torch.zeros_like(x_i_name)
                 for nj in N_in:
                     consensus.add_(gamma_k * w * (snapshot_states[nj][name] - x_i_name))
 
-                # gradient term: lambda * grad
-                g = grad_map[cid].get(name, None)
-                if g is None:
-                    grad_term = torch.zeros_like(x_i_name)
-                else:
-                    # match dtype/device if needed
-                    if g.device != x_i_name.device:
-                        g = g.to(x_i_name.device)
-                    if g.dtype != x_i_name.dtype:
-                        g = g.to(x_i_name.dtype)
-                    grad_term = lambda_k * g
+                new_state[name] = x_i_name + consensus
 
-                new_state[name] = x_i_name + consensus - grad_term
-
-            # write back x_i^{k+1}
             c.local_model.load_state_dict(new_state)
 
-        # ---- build proxy model (global mean) for early stopping / checkpoint ----
-        
-        if early_stopping.early_stop:
-            trace_func(f"Stopped early, stop epoch:{early_stopping.best_epoch+1}")
-            trace_func(f"Global Model Val Acc: {100*early_stopping.best_val_acc:.2f}%")
-            break
+        # ONE-TIME evaluation on held-out test_dataset (per node) 
+        Node_TestAcc_List_round = {}
+        accs = []
+        losses = []
+
+        for c in clients:
+            tl, ta = c.local_eval(c.local_model)
+            tl = tl.item()
+            
+            Node_TestAcc_List_round[c.client_id] = {
+                "acc": round(100 * ta, 2),
+                "loss": round(tl, 4),
+            }
+            accs.append(ta)
+            losses.append(tl)
+
+        avg_acc = sum(accs) / len(accs)
+        avg_loss = sum(losses) / len(losses)
+
+
+        progress.set_postfix({
+            "test_loss": f"{avg_loss:.4f}",
+            "test_acc": f"{100*avg_acc:.2f}%",
+            "center": str(center_id),
+        })
+
+        Round_TestAcc_List.append(Node_TestAcc_List_round)
+
 
     progress.close()
 
-    if not early_stopping.early_stop:
-        trace_func(f"Not stopped early, stop epoch:{early_stopping.best_epoch+1}")
-        trace_func(f"Global Model Val Acc: {100*early_stopping.best_val_acc:.2f}%")
+    Node_TestAcc_List = Round_TestAcc_List[-1] if len(Round_TestAcc_List) > 0 else {}
 
-    # -------------------------
-    # Per-node test on held-out subject
-    # Store this train() call's per-node acc into TestAcc_List
-    # -------------------------
-    Node_TestAcc_List = {}
     trace_func("Per-node test accuracy (held-out subject):")
-
-    for c in clients:
-        node_model = copy.deepcopy(c.local_model)
-        node_model.eval()
-
-        test_loss, test_acc = evaluate_model(node_model, test_dataset, c.device)
-        Node_TestAcc_List[c.client_id] = round(100 * test_acc, 2)
-
-        trace_func(f"  Client {c.client_id}: {100*test_acc:.2f}% (loss {test_loss:.4f})")
+    for cid in sorted(Node_TestAcc_List.keys()):
+        trace_func(
+            f"  Client {cid}: {Node_TestAcc_List[cid]['acc']:.2f}% (loss {Node_TestAcc_List[cid]['loss']:.4f})"
+        )
+    
 
     TestAcc_List.append(Node_TestAcc_List)
-
+    
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Federated Learning for BCIs")
@@ -333,9 +269,59 @@ if __name__ == "__main__":
         default=False,
         help="if true, early stopping",
     )
-    
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=50,
+        help="the number of communication rounds patience",
+    )
+    parser.add_argument(
+        "--fedprox",
+        type=lambda x: bool(distutils.util.strtobool(x)),
+        default=False,
+        help="if true, perform fedprox",
+    )
+    parser.add_argument("--mu", type=float, default=1.0, help="mu for fedprox")
+    parser.add_argument(
+        "--scaffold",
+        type=lambda x: bool(distutils.util.strtobool(x)),
+        default=False,
+        help="if true, perform scaffold",
+    )
+    parser.add_argument(
+        "--moon",
+        type=lambda x: bool(distutils.util.strtobool(x)),
+        default=False,
+        help="if true, perform moon",
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=0.5, help="the temperature for moon"
+    )
+    parser.add_argument("--mu_moon", type=float, default=1.0, help="mu for moon")
+    parser.add_argument(
+        "--fedfa",
+        type=lambda x: bool(distutils.util.strtobool(x)),
+        default=False,
+        help="if true, perform fedfa",
+    )
+    parser.add_argument("--prob", type=float, default=0.5, help="probability for fedfa")
+    parser.add_argument(
+        "--GA",
+        type=lambda x: bool(distutils.util.strtobool(x)),
+        default=False,
+        help="if true, perform GA",
+    )
+    parser.add_argument(
+        "--step_size", type=float, default=0.05, help="the step size of GA"
+    )
+    parser.add_argument(
+        "--fedbs",
+        type=lambda x: bool(distutils.util.strtobool(x)),
+        default=False,
+        help="if true, perform fedbs",
+    )
+    parser.add_argument("--rho", type=float, default=0.1, help="rho for fedbs")
 
-    # About setup and hyperparameters for federated approaches
     
 
     args = parser.parse_args()
@@ -353,14 +339,13 @@ if __name__ == "__main__":
 
     TestAcc_List = []
     subject_id = [int(i) for i in args.sub_id.split(",")]
-
+    id =1
     for id in subject_id:
         test_set_id = []
         test_set_id.append(id)
         tmp = subject_id.copy()
         tmp.remove(id)
         client_subject_id = tmp
-
         print("----------------------------------------------------------------")
         t_start = time.time() 
         print("Test subject ID: ", test_set_id)
@@ -378,30 +363,41 @@ if __name__ == "__main__":
         print(f"Test set id {test_set_id} Complete")
         print("----------------------------------------------------------------")
 
-    mean = round(sum(TestAcc_List) / len(TestAcc_List), 2)
-    TestAcc_List.append(mean)
 
-    print("==============================================================\n")
+    print("=" * 70)
 
     for r, round_dict in enumerate(TestAcc_List, start=1):
         client_ids = sorted(round_dict.keys())
-
         accs = [round_dict[cid]["acc"] for cid in client_ids]
         losses = [round_dict[cid]["loss"] for cid in client_ids]
 
         avg_acc = sum(accs) / len(accs)
         avg_loss = sum(losses) / len(losses)
 
-        print(f"round {r}:")
-        print("client :", " ".join(f"{cid:>4}" for cid in client_ids), " avg")
-        print(
-            "acc    :",
-            " ".join(f"{acc:>4.2f}" for acc in accs),
-            f"{avg_acc:>4.2f}",
-        )
-        print(
-            "loss   :",
-            " ".join(f"{loss:>4.4f}" for loss in losses),
-            f"{avg_loss:>4.4f}",
-        )
-        print("-" * 60)
+        col_w = 8  # 每列宽度
+        sep = "|"
+
+        print(f"Round {r}")
+        print("-" * 70)
+
+        # header
+        header = f"{'Client':<6} {sep} " + " ".join(
+            f"{cid:>{col_w}d}" for cid in client_ids
+        ) + f" {sep} {'AVG':>{col_w}}"
+        print(header)
+
+        print("-" * 70)
+
+        # acc row
+        acc_row = f"{'Acc':<6} {sep} " + " ".join(
+            f"{acc:>{col_w}.2f}" for acc in accs
+        ) + f" {sep} {avg_acc:>{col_w}.2f}"
+        print(acc_row)
+
+        # loss row
+        loss_row = f"{'Loss':<6} {sep} " + " ".join(
+            f"{loss:>{col_w}.4f}" for loss in losses
+        ) + f" {sep} {avg_loss:>{col_w}.4f}"
+        print(loss_row)
+
+        print("=" * 70)
