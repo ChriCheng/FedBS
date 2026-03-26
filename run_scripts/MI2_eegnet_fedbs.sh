@@ -1,4 +1,4 @@
-python3 -u ../src/train.py \
+exec python3 -u ../src/train.py \
 --model eegnet \
 --sample_rate 250 \
 --F1 8 \

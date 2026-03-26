@@ -1,4 +1,4 @@
-python3 -u ../src/train.py \
+exec python3 -u ../src/train.py \
 --model deepconvnet \
 --sample_rate 250 \
 --TemporalKernel_Times 1 \
